@@ -11,14 +11,17 @@ Kiro CLI 思考深度注入代理 — 通过中间人代理拦截 Kiro CLI 的 A
 ## How It Works
 
 ```
-kiro-cli ──→ :8960 (kiro-think) ──→ upstream proxy ──→ AWS API
-                    │
-                    ├─ Intercept GenerateAssistantResponse
-                    ├─ Inject <thinking>enabled</thinking><budget>24576</budget>
-                    └─ Forward modified request (other requests pass through untouched)
+kiro-cli ──h2──→ :8960 (kiro-think) ──h2──→ upstream proxy ──→ AWS API
+                       │
+                       ├─ MITM with full HTTP/2 support (ALPN h2)
+                       ├─ Intercept GenerateAssistantResponse
+                       ├─ Inject <thinking>enabled</thinking><budget>24576</budget>
+                       └─ Forward modified request (other requests pass through untouched)
 ```
 
-Kiro CLI uses an internal AWS API (`GenerateAssistantResponse`) for chat. The thinking depth is controlled by XML tags injected into the first user message in conversation history. This proxy intercepts **only** those specific requests and injects/overrides the thinking budget tags before forwarding. All other traffic (including non-Kiro HTTPS) is tunneled through without decryption or modification.
+Kiro CLI uses an internal AWS API (`GenerateAssistantResponse`) for chat over HTTP/2. The thinking depth is controlled by XML tags injected into the first user message in conversation history. This proxy intercepts **only** those specific requests and injects/overrides the thinking budget tags before forwarding. All other traffic (including non-Kiro HTTPS) is tunneled through without decryption or modification.
+
+The proxy supports **full HTTP/2** on both client and upstream sides — Kiro CLI's h2 requests are handled natively via `http2.Server.ServeConn`, and upstream connections use `http.Transport` with h2 ALPN negotiation and connection pooling. HTTP/1.1 clients are also supported transparently.
 
 ## Prerequisites
 
@@ -199,12 +202,12 @@ The Kiro API controls thinking via XML tags prepended to the system message in `
 
 This proxy:
 1. Intercepts HTTPS CONNECT requests and checks if the hostname is in `targets`
-2. For target hosts: terminates TLS with a dynamically generated certificate, decrypts the request
-3. Identifies `GenerateAssistantResponse` by the `x-amz-target` header
-4. Parses the JSON body, finds the first user message in `conversationState.history`
-5. Strips existing `<thinking>`, `<budget>`, `<effort>` tags
-6. Prepends the configured tags
-7. Forwards the modified request through the upstream proxy
+2. For target hosts: terminates TLS with a dynamically generated certificate, negotiating **h2** or **http/1.1** via ALPN
+3. Serves the MITM'd connection using `http2.Server.ServeConn` (h2) or `http.Server` (h1)
+4. Identifies `GenerateAssistantResponse` by the `x-amz-target` header
+5. Parses the JSON body, finds the first user message in `conversationState.history`
+6. Strips existing `<thinking>`, `<budget>`, `<effort>` tags and prepends the configured tags
+7. Forwards via a shared `http.Transport` with h2 ALPN and connection pooling to the upstream
 
 ## Acknowledgments
 

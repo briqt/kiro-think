@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -10,8 +11,10 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
-	"time"
+
+	"golang.org/x/net/http2"
 
 	"github.com/briqt/kiro-think/internal/cert"
 	"github.com/briqt/kiro-think/internal/config"
@@ -22,6 +25,9 @@ type Server struct {
 	cfg      atomic.Pointer[config.Config]
 	certMgr  *cert.Manager
 	listener net.Listener
+
+	// Per-host upstream transport with h2 support and connection pooling.
+	transports sync.Map // host -> *http.Transport
 }
 
 func New(cfg *config.Config, certMgr *cert.Manager) *Server {
@@ -32,6 +38,11 @@ func New(cfg *config.Config, certMgr *cert.Manager) *Server {
 
 func (s *Server) Reload(cfg *config.Config) {
 	s.cfg.Store(cfg)
+	s.transports.Range(func(key, val any) bool {
+		val.(*http.Transport).CloseIdleConnections()
+		s.transports.Delete(key)
+		return true
+	})
 	log.Printf("config reloaded: level=%s budget=%d mode=%s",
 		cfg.Thinking.Level, cfg.Thinking.Budget, cfg.Thinking.Mode)
 }
@@ -58,17 +69,36 @@ func (s *Server) Close() {
 	}
 }
 
-// dialRemote connects to host:port either directly or via upstream proxy.
-func (s *Server) dialRemote(hostport string, cfg *config.Config) (net.Conn, error) {
-	if cfg.Upstream == "" {
-		return net.Dial("tcp", hostport)
+// getTransport returns a shared, h2-capable http.Transport for the given host.
+func (s *Server) getTransport(host string) *http.Transport {
+	if v, ok := s.transports.Load(host); ok {
+		return v.(*http.Transport)
 	}
-	// Via upstream CONNECT
-	upConn, err := net.Dial("tcp", cfg.Upstream)
+	cfg := s.cfg.Load()
+	t := &http.Transport{
+		TLSClientConfig:   &tls.Config{ServerName: host},
+		ForceAttemptHTTP2:  true,
+		DisableCompression: true,
+	}
+	if cfg.Upstream != "" {
+		t.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return s.dialUpstreamTLS(ctx, addr, host)
+		}
+	}
+	http2.ConfigureTransport(t)
+	actual, _ := s.transports.LoadOrStore(host, t)
+	return actual.(*http.Transport)
+}
+
+// dialUpstreamTLS dials through the upstream CONNECT proxy and completes TLS with h2 ALPN.
+func (s *Server) dialUpstreamTLS(ctx context.Context, addr, host string) (net.Conn, error) {
+	cfg := s.cfg.Load()
+	var d net.Dialer
+	upConn, err := d.DialContext(ctx, "tcp", cfg.Upstream)
 	if err != nil {
 		return nil, fmt.Errorf("upstream dial: %w", err)
 	}
-	fmt.Fprintf(upConn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", hostport, hostport)
+	fmt.Fprintf(upConn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", addr, addr)
 	resp, err := http.ReadResponse(bufio.NewReader(upConn), nil)
 	if err != nil {
 		upConn.Close()
@@ -78,7 +108,15 @@ func (s *Server) dialRemote(hostport string, cfg *config.Config) (net.Conn, erro
 		upConn.Close()
 		return nil, fmt.Errorf("upstream CONNECT: %s", resp.Status)
 	}
-	return upConn, nil
+	tlsConn := tls.Client(upConn, &tls.Config{
+		ServerName: host,
+		NextProtos: []string{"h2", "http/1.1"},
+	})
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		upConn.Close()
+		return nil, err
+	}
+	return tlsConn, nil
 }
 
 func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
@@ -113,42 +151,39 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// MITM: TLS terminate, inspect, forward
+	// MITM: TLS terminate with h2 ALPN, inspect, forward.
 	clientConn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
 	tlsConn := tls.Server(clientConn, &tls.Config{
 		GetCertificate: s.certMgr.GetCertificate,
+		NextProtos:     []string{"h2", "http/1.1"},
 	})
 	if err := tlsConn.Handshake(); err != nil {
 		clientConn.Close()
 		return
 	}
 
-	br := bufio.NewReader(tlsConn)
-	for {
-		req, err := http.ReadRequest(br)
-		if err != nil {
-			break
-		}
-		s.forwardRequest(tlsConn, req, host, cfg)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.proxyRequest(w, r, host)
+	})
+
+	proto := tlsConn.ConnectionState().NegotiatedProtocol
+	if proto == "h2" {
+		h2srv := &http2.Server{}
+		h2srv.ServeConn(tlsConn, &http2.ServeConnOpts{Handler: handler})
+	} else {
+		srv := &http.Server{Handler: handler}
+		srv.Serve(&singleConnListener{conn: tlsConn})
 	}
-	tlsConn.Close()
 }
 
-func (s *Server) isTarget(host string, cfg *config.Config) bool {
-	for _, t := range cfg.Targets {
-		if strings.EqualFold(host, t) {
-			return true
-		}
-	}
-	return false
-}
+// proxyRequest handles both h1 and h2 requests: inject thinking, forward upstream, stream back.
+func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, host string) {
+	cfg := s.cfg.Load()
 
-func (s *Server) forwardRequest(clientConn net.Conn, req *http.Request, host string, cfg *config.Config) {
-	body, _ := io.ReadAll(req.Body)
-	req.Body.Close()
+	body, _ := io.ReadAll(r.Body)
+	r.Body.Close()
 
-	// Inject thinking tags
-	target := req.Header.Get("X-Amz-Target")
+	target := r.Header.Get("X-Amz-Target")
 	isChat := strings.Contains(target, "GenerateAssistantResponse")
 	var modelID string
 	if isChat {
@@ -161,68 +196,75 @@ func (s *Server) forwardRequest(clientConn net.Conn, req *http.Request, host str
 		}
 	}
 
-	// Connect to target
-	rawConn, err := s.dialRemote(host+":443", cfg)
+	upReq, err := http.NewRequestWithContext(r.Context(), r.Method, "https://"+host+r.URL.RequestURI(), bytes.NewReader(body))
 	if err != nil {
-		log.Printf("dial error: %v", err)
+		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
+	for k, vv := range r.Header {
+		if isHopByHop(k) {
+			continue
+		}
+		for _, v := range vv {
+			upReq.Header.Add(k, v)
+		}
+	}
+	upReq.Header.Del("Accept-Encoding")
+	upReq.ContentLength = int64(len(body))
 
-	tlsUp := tls.Client(rawConn, &tls.Config{ServerName: host})
-	if err := tlsUp.Handshake(); err != nil {
-		rawConn.Close()
-		log.Printf("TLS error: %v", err)
+	upResp, err := s.getTransport(host).RoundTrip(upReq)
+	if err != nil {
+		log.Printf("upstream error: %v", err)
+		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
+	defer upResp.Body.Close()
 
-	req.Header.Del("Accept-Encoding")
-	req.ContentLength = int64(len(body))
-	req.Header.Set("Content-Length", fmt.Sprintf("%d", len(body)))
-	req.Host = host
-	req.URL.Scheme = "https"
-	req.URL.Host = host
-	req.RequestURI = ""
-	req.Body = io.NopCloser(bytes.NewReader(body))
-
-	if err := req.Write(tlsUp); err != nil {
-		tlsUp.Close()
-		return
+	for k, vv := range upResp.Header {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
 	}
+	w.WriteHeader(upResp.StatusCode)
 
-	// For chat requests: raw-pipe entire TLS stream to preserve chunked/event-stream
-	// encoding, while teeing to capture token info.
-	// For other requests: use http.ReadResponse for clean handling.
-	if isChat {
-		var captured bytes.Buffer
+	// Stream with flush for event-stream responses (chat).
+	if f, ok := w.(http.Flusher); ok && isChat {
 		buf := make([]byte, 32*1024)
 		for {
-			tlsUp.SetReadDeadline(time.Now().Add(5 * time.Second))
-			n, readErr := tlsUp.Read(buf)
+			n, readErr := upResp.Body.Read(buf)
 			if n > 0 {
-				clientConn.Write(buf[:n])
-				captured.Write(buf[:n])
+				w.Write(buf[:n])
+				f.Flush()
 			}
 			if readErr != nil {
 				break
 			}
 		}
-		if s.cfg.Load().Debug {
-			model := extractModelFromEventStream(captured.Bytes())
-			if model == "" {
-				model = modelID
-			}
-			log.Printf("  [debug] ← %dB→%dB model=%s", len(body), captured.Len(), model)
-		}
 	} else {
-		upResp, err := http.ReadResponse(bufio.NewReader(tlsUp), req)
-		if err == nil {
-			upResp.Write(clientConn)
-			if s.cfg.Load().Debug {
-				log.Printf("  [debug] ← %d %s", upResp.StatusCode, target)
-			}
+		io.Copy(w, upResp.Body)
+	}
+
+	if cfg.Debug {
+		log.Printf("  [debug] ← %d %s (%dB)", upResp.StatusCode, target, len(body))
+	}
+}
+
+func isHopByHop(k string) bool {
+	switch strings.ToLower(k) {
+	case "connection", "keep-alive", "proxy-connection",
+		"transfer-encoding", "upgrade", "te":
+		return true
+	}
+	return false
+}
+
+func (s *Server) isTarget(host string, cfg *config.Config) bool {
+	for _, t := range cfg.Targets {
+		if strings.EqualFold(host, t) {
+			return true
 		}
 	}
-	tlsUp.Close()
+	return false
 }
 
 func (s *Server) tunnel(clientConn net.Conn, target string, cfg *config.Config) {
@@ -239,16 +281,25 @@ func (s *Server) tunnel(clientConn net.Conn, target string, cfg *config.Config) 
 	remoteConn.Close()
 }
 
-// extractModelFromEventStream scans AWS Event Stream binary data for modelId.
-func extractModelFromEventStream(data []byte) string {
-	s := string(data)
-	if i := strings.Index(s, `"modelId":"`); i >= 0 {
-		sub := s[i+len(`"modelId":"`):]
-		if end := strings.Index(sub, `"`); end >= 0 {
-			return sub[:end]
-		}
+func (s *Server) dialRemote(hostport string, cfg *config.Config) (net.Conn, error) {
+	if cfg.Upstream == "" {
+		return net.Dial("tcp", hostport)
 	}
-	return ""
+	upConn, err := net.Dial("tcp", cfg.Upstream)
+	if err != nil {
+		return nil, fmt.Errorf("upstream dial: %w", err)
+	}
+	fmt.Fprintf(upConn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", hostport, hostport)
+	resp, err := http.ReadResponse(bufio.NewReader(upConn), nil)
+	if err != nil {
+		upConn.Close()
+		return nil, fmt.Errorf("upstream CONNECT: %w", err)
+	}
+	if resp.StatusCode != 200 {
+		upConn.Close()
+		return nil, fmt.Errorf("upstream CONNECT: %s", resp.Status)
+	}
+	return upConn, nil
 }
 
 func (s *Server) handlePlain(w http.ResponseWriter, r *http.Request) {
@@ -266,3 +317,36 @@ func (s *Server) handlePlain(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
 }
+
+// singleConnListener wraps a net.Conn as a one-shot net.Listener for http.Server.Serve.
+type singleConnListener struct {
+	conn net.Conn
+	once sync.Once
+	done chan struct{}
+}
+
+func (l *singleConnListener) Accept() (net.Conn, error) {
+	var accepted bool
+	l.once.Do(func() {
+		l.done = make(chan struct{})
+		accepted = true
+	})
+	if accepted {
+		return l.conn, nil
+	}
+	<-l.done
+	return nil, io.EOF
+}
+
+func (l *singleConnListener) Close() error {
+	if l.done != nil {
+		select {
+		case <-l.done:
+		default:
+			close(l.done)
+		}
+	}
+	return nil
+}
+
+func (l *singleConnListener) Addr() net.Addr { return l.conn.LocalAddr() }
