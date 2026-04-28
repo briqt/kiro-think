@@ -1,0 +1,13 @@
+{
+  "listen": ":3066",
+  "upstream": "127.0.0.1:3067",
+  "thinking": {
+    "mode": "enabled",
+    "level": "max",
+    "budget": 24576
+  },
+  "log_file": "~/.kiro-think/kiro-think.log",
+  "targets": [
+    "q.us-east-1.amazonaws.com"
+  ]
+}
