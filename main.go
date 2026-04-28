@@ -80,7 +80,7 @@ Commands:
   status          Show proxy status
   level [LEVEL]   Get or set thinking level (low/medium/high/xhigh/max)
   run-kiro        Launch kiro-cli through the proxy (auto-sets env vars)
-  setup           Print shell alias for easy kiro-cli launching
+  setup           Interactive first-time setup (config, certs, alias, start)
   run             Run proxy in foreground (for debugging)
   version         Show version info
   help            Show this help
@@ -203,27 +203,191 @@ func cmdRunKiro() {
 }
 
 func cmdSetup() {
-	cfg, _ := config.Load()
-	port := "8960"
-	if i := strings.LastIndex(cfg.Listen, ":"); i >= 0 {
-		port = cfg.Listen[i+1:]
+	fmt.Println("🧠 kiro-think setup")
+	fmt.Println()
+
+	// Resolve absolute path of this binary
+	exePath, _ := os.Executable()
+	exePath, _ = filepath.EvalSymlinks(exePath)
+	absExe, err := filepath.Abs(exePath)
+	if err == nil {
+		exePath = absExe
 	}
 
-	exePath, _ := os.Executable()
-	combinedCA := filepath.Join(config.Dir(), "combined-ca.crt")
-	proxyURL := fmt.Sprintf("http://127.0.0.1:%s", port)
+	cfg := config.Default()
 
-	fmt.Println("# Add this to your ~/.bashrc or ~/.zshrc:")
+	// If config already exists, ask whether to reconfigure
+	if _, err := os.Stat(config.Path()); err == nil {
+		existing, _ := config.Load()
+		if existing != nil {
+			if !askYN("Config already exists at "+config.Path()+". Reconfigure?", false) {
+				cfg = existing
+				goto skipConfig
+			}
+			cfg = existing
+		}
+	}
+
+	// Step 1: Listen port
+	{
+		port := prompt("Listen port", "8960")
+		cfg.Listen = ":" + port
+	}
+
+	// Step 2: Upstream proxy
+	{
+		fmt.Println()
+		fmt.Println("Upstream proxy (if you use a proxy to access the internet).")
+		fmt.Println("Leave empty for direct connection (most users).")
+		cfg.Upstream = prompt("Upstream proxy (host:port)", cfg.Upstream)
+	}
+
+	// Step 3: Thinking level
+	{
+		fmt.Println()
+		fmt.Println("Thinking levels:")
+		levels := []string{"low", "medium", "high", "xhigh", "max"}
+		for _, l := range levels {
+			fmt.Printf("  %-8s %d tokens\n", l, config.ThinkingLevels[l])
+		}
+		level := prompt("Default thinking level", "max")
+		if !cfg.SetLevel(level) {
+			fmt.Printf("  invalid level %q, using max\n", level)
+			cfg.SetLevel("max")
+		}
+	}
+
+	// Step 4: Thinking mode
+	{
+		fmt.Println()
+		fmt.Println("Thinking mode:")
+		fmt.Println("  enabled   - fixed budget tokens (recommended)")
+		fmt.Println("  adaptive  - effort-based, model decides depth")
+		mode := prompt("Thinking mode", "enabled")
+		if mode == "adaptive" || mode == "enabled" {
+			cfg.Thinking.Mode = mode
+		} else {
+			fmt.Printf("  invalid mode %q, using enabled\n", mode)
+			cfg.Thinking.Mode = "enabled"
+		}
+	}
+
+	// Save config
+	if err := config.Save(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "error saving config: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("\n✅ Config saved to %s\n", config.Path())
+
+skipConfig:
+	// Step 5: Generate CA cert
 	fmt.Println()
-	fmt.Printf("alias kiro='%s run-kiro'\n", exePath)
+	fmt.Println("Generating CA certificate...")
+	if _, err := cert.NewManager(); err != nil {
+		fmt.Fprintf(os.Stderr, "error generating cert: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("✅ CA cert: %s\n", filepath.Join(config.Dir(), "ca.crt"))
+	fmt.Printf("✅ Combined CA: %s\n", filepath.Join(config.Dir(), "combined-ca.crt"))
+
+	// Step 6: Shell alias
 	fmt.Println()
-	fmt.Println("# Or if you prefer manual env vars:")
+	shell := detectShell()
+	rcFile := shellRC(shell)
+	aliasLine := fmt.Sprintf("alias kiro='%s run-kiro'", exePath)
+
+	if rcFile != "" {
+		// Check if alias already exists
+		if content, err := os.ReadFile(rcFile); err == nil && strings.Contains(string(content), "kiro-think") {
+			fmt.Printf("✅ Shell alias already configured in %s\n", rcFile)
+		} else if askYN(fmt.Sprintf("Add alias to %s?", rcFile), true) {
+			f, err := os.OpenFile(rcFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "  error: %v\n", err)
+			} else {
+				fmt.Fprintf(f, "\n# kiro-think: launch kiro-cli with thinking injection\n%s\n", aliasLine)
+				f.Close()
+				fmt.Printf("✅ Alias added to %s\n", rcFile)
+				fmt.Printf("   Run: source %s\n", rcFile)
+			}
+		}
+	} else {
+		fmt.Println("Could not detect shell rc file. Add this manually:")
+		fmt.Printf("  %s\n", aliasLine)
+	}
+
+	// Step 7: Start daemon
 	fmt.Println()
-	fmt.Printf("export SSL_CERT_FILE=\"%s\"\n", combinedCA)
-	fmt.Printf("export HTTPS_PROXY=\"%s\"\n", proxyURL)
-	fmt.Printf("export HTTP_PROXY=\"%s\"\n", proxyURL)
+	if askYN("Start the proxy now?", true) {
+		if pid, running := daemon.IsRunning(); running {
+			fmt.Printf("✅ Already running (pid %d)\n", pid)
+		} else if err := daemon.Start(); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		} else {
+			fmt.Println("✅ Proxy started")
+		}
+	}
+
+	// Done
 	fmt.Println()
-	fmt.Println("# Then just run: kiro-cli chat")
+	fmt.Println("🎉 Setup complete! Usage:")
+	fmt.Println()
+	fmt.Println("  kiro                    # launch kiro-cli with thinking injection")
+	fmt.Println("  kiro-think level max    # change thinking level")
+	fmt.Println("  kiro-think status       # check proxy status")
+}
+
+func prompt(label, defaultVal string) string {
+	if defaultVal != "" {
+		fmt.Printf("%s [%s]: ", label, defaultVal)
+	} else {
+		fmt.Printf("%s: ", label)
+	}
+	var input string
+	fmt.Scanln(&input)
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return defaultVal
+	}
+	return input
+}
+
+func askYN(question string, defaultYes bool) bool {
+	hint := "[y/N]"
+	if defaultYes {
+		hint = "[Y/n]"
+	}
+	fmt.Printf("%s %s ", question, hint)
+	var input string
+	fmt.Scanln(&input)
+	input = strings.TrimSpace(strings.ToLower(input))
+	if input == "" {
+		return defaultYes
+	}
+	return input == "y" || input == "yes"
+}
+
+func detectShell() string {
+	shell := os.Getenv("SHELL")
+	if strings.Contains(shell, "zsh") {
+		return "zsh"
+	}
+	if strings.Contains(shell, "fish") {
+		return "fish"
+	}
+	return "bash"
+}
+
+func shellRC(shell string) string {
+	home, _ := os.UserHomeDir()
+	switch shell {
+	case "zsh":
+		return filepath.Join(home, ".zshrc")
+	case "fish":
+		return filepath.Join(home, ".config", "fish", "config.fish")
+	default:
+		return filepath.Join(home, ".bashrc")
+	}
 }
 
 func cmdRun() {
