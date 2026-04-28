@@ -149,10 +149,15 @@ func (s *Server) forwardRequest(clientConn net.Conn, req *http.Request, host str
 
 	// Inject thinking tags
 	target := req.Header.Get("X-Amz-Target")
-	if strings.Contains(target, "GenerateAssistantResponse") {
-		if newBody, ok := inject.InjectThinking(body, cfg.Thinking); ok {
-			body = newBody
-			log.Printf("💉 injected: %s", inject.GeneratePrefix(cfg.Thinking))
+	isChat := strings.Contains(target, "GenerateAssistantResponse")
+	var modelID string
+	if isChat {
+		var injected bool
+		body, injected, modelID = inject.InjectThinking(body, cfg.Thinking)
+		if injected {
+			log.Printf("💉 [%s] %s", modelID, inject.GeneratePrefix(cfg.Thinking))
+		} else if modelID != "" {
+			log.Printf("⏭️  [%s] skipped (not in whitelist)", modelID)
 		}
 	}
 
@@ -187,10 +192,9 @@ func (s *Server) forwardRequest(clientConn net.Conn, req *http.Request, host str
 	// For chat requests: raw-pipe entire TLS stream to preserve chunked/event-stream
 	// encoding, while teeing to capture token info.
 	// For other requests: use http.ReadResponse for clean handling.
-	if strings.Contains(target, "GenerateAssistantResponse") {
+	if isChat {
 		var captured bytes.Buffer
 		buf := make([]byte, 32*1024)
-		// Set read deadline: if no data for 5s after last read, assume stream ended
 		for {
 			tlsUp.SetReadDeadline(time.Now().Add(5 * time.Second))
 			n, readErr := tlsUp.Read(buf)
@@ -202,13 +206,20 @@ func (s *Server) forwardRequest(clientConn net.Conn, req *http.Request, host str
 				break
 			}
 		}
-		usage := extractUsageFromEventStream(captured.Bytes())
-		log.Printf("← (%dB→%dB) %s | %s", len(body), captured.Len(), target, usage)
+		if s.cfg.Load().Debug {
+			model := extractModelFromEventStream(captured.Bytes())
+			if model == "" {
+				model = modelID
+			}
+			log.Printf("  [debug] ← %dB→%dB model=%s", len(body), captured.Len(), model)
+		}
 	} else {
 		upResp, err := http.ReadResponse(bufio.NewReader(tlsUp), req)
 		if err == nil {
 			upResp.Write(clientConn)
-			log.Printf("← %d %s", upResp.StatusCode, target)
+			if s.cfg.Load().Debug {
+				log.Printf("  [debug] ← %d %s", upResp.StatusCode, target)
+			}
 		}
 	}
 	tlsUp.Close()
@@ -228,40 +239,16 @@ func (s *Server) tunnel(clientConn net.Conn, target string, cfg *config.Config) 
 	remoteConn.Close()
 }
 
-// extractUsageFromEventStream scans AWS Event Stream binary data for
-// contextUsagePercentage and modelId fields embedded in JSON payloads.
-func extractUsageFromEventStream(data []byte) string {
+// extractModelFromEventStream scans AWS Event Stream binary data for modelId.
+func extractModelFromEventStream(data []byte) string {
 	s := string(data)
-	var parts []string
-
-	// Extract contextUsagePercentage
-	if i := strings.Index(s, `"contextUsagePercentage"`); i >= 0 {
-		// Find the number after the colon
-		sub := s[i:]
-		if ci := strings.Index(sub, ":"); ci >= 0 {
-			numStart := ci + 1
-			for numStart < len(sub) && (sub[numStart] == ' ' || sub[numStart] == '\t') {
-				numStart++
-			}
-			numEnd := numStart
-			for numEnd < len(sub) && (sub[numEnd] == '.' || (sub[numEnd] >= '0' && sub[numEnd] <= '9')) {
-				numEnd++
-			}
-			if numEnd > numStart {
-				parts = append(parts, "context="+sub[numStart:numEnd]+"%")
-			}
-		}
-	}
-
-	// Extract modelId
 	if i := strings.Index(s, `"modelId":"`); i >= 0 {
 		sub := s[i+len(`"modelId":"`):]
 		if end := strings.Index(sub, `"`); end >= 0 {
-			parts = append(parts, "model="+sub[:end])
+			return sub[:end]
 		}
 	}
-
-	return strings.Join(parts, " ")
+	return ""
 }
 
 func (s *Server) handlePlain(w http.ResponseWriter, r *http.Request) {

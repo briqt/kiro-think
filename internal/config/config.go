@@ -28,6 +28,7 @@ type Config struct {
 	Thinking ThinkingConfig `json:"thinking"`
 	LogFile  string         `json:"log_file"`
 	Targets  []string       `json:"targets"`
+	Debug    bool           `json:"debug"`
 }
 
 func Dir() string {
