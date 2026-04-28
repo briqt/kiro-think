@@ -3,6 +3,7 @@ package setup
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -217,10 +218,17 @@ func detectUpstream() string {
 }
 
 func resolveExePath() string {
+	// Prefer the PATH-resolved location (e.g. ~/go/bin/kiro-think from go install)
+	// over os.Executable (which may point to a temp build directory).
+	if p, err := exec.LookPath("kiro-think"); err == nil {
+		if abs, err := filepath.Abs(p); err == nil {
+			return abs
+		}
+		return p
+	}
 	exe, _ := os.Executable()
 	exe, _ = filepath.EvalSymlinks(exe)
-	abs, err := filepath.Abs(exe)
-	if err == nil {
+	if abs, err := filepath.Abs(exe); err == nil {
 		return abs
 	}
 	return exe
