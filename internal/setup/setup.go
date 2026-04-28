@@ -79,7 +79,8 @@ func AutoInit() error {
 }
 
 // InteractiveSetup walks the user through full configuration.
-func InteractiveSetup() error {
+// startFn is called to start the daemon if the user agrees.
+func InteractiveSetup(startFn func() error) error {
 	fmt.Println("🧠 kiro-think setup")
 	fmt.Println()
 
@@ -179,9 +180,14 @@ startDaemon:
 	// 8. Start daemon
 	fmt.Println()
 	if askYN("Start the proxy now?", true) {
-		fmt.Println("  Starting proxy...")
-		// Import cycle prevention: caller handles this via return value
-		fmt.Println("  Run: kiro-think restart")
+		if startFn != nil {
+			if err := startFn(); err != nil {
+				fmt.Fprintf(os.Stderr, "  ⚠️  start failed: %v\n", err)
+				fmt.Println("  Run manually: kiro-think start")
+			} else {
+				fmt.Println("  ✅ Proxy started")
+			}
+		}
 	}
 
 	fmt.Println()

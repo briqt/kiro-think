@@ -47,7 +47,10 @@ func main() {
 		}
 		return
 	case "setup":
-		if err := setup.InteractiveSetup(); err != nil {
+		if err := setup.InteractiveSetup(func() error {
+			daemon.Stop() // stop if running
+			return daemon.Start()
+		}); err != nil {
 			fmt.Fprintf(os.Stderr, "setup error: %v\n", err)
 			os.Exit(1)
 		}
