@@ -3,6 +3,6 @@
 # Usage: ./kiro-cli-proxy.sh [kiro-cli args...]
 exec env \
   SSL_CERT_FILE="$HOME/.kiro-think/combined-ca.crt" \
-  HTTPS_PROXY="http://127.0.0.1:3066" \
-  HTTP_PROXY="http://127.0.0.1:3066" \
+  HTTPS_PROXY="http://127.0.0.1:8960" \
+  HTTP_PROXY="http://127.0.0.1:8960" \
   kiro-cli chat "$@"

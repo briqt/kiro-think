@@ -1,5 +1,5 @@
 {
-  "listen": ":3066",
+  "listen": ":8960",
   "upstream": "127.0.0.1:3067",
   "thinking": {
     "mode": "enabled",

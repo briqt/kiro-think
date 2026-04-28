@@ -7,7 +7,7 @@ Kiro CLI 思考深度注入代理 — 通过中间人代理拦截 Kiro CLI 的 A
 ## How It Works
 
 ```
-kiro-cli ──→ :3066 (kiro-think) ──→ :3067 (upstream proxy) ──→ AWS API
+kiro-cli ──→ :8960 (kiro-think) ──→ :3067 (upstream proxy) ──→ AWS API
                     │
                     ├─ Intercept GenerateAssistantResponse
                     ├─ Inject <thinking>enabled</thinking><budget>24576</budget>
@@ -32,7 +32,7 @@ kiro-think start
 
 # 2. Launch kiro-cli through the proxy
 SSL_CERT_FILE=~/.kiro-think/combined-ca.crt \
-HTTPS_PROXY=http://127.0.0.1:3066 \
+HTTPS_PROXY=http://127.0.0.1:8960 \
 kiro-cli chat
 
 # Or use the helper script:
@@ -77,7 +77,7 @@ Config file: `~/.kiro-think/config.json` (auto-generated on first run)
 
 ```json
 {
-  "listen": ":3066",
+  "listen": ":8960",
   "upstream": "127.0.0.1:3067",
   "thinking": {
     "mode": "enabled",
