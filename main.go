@@ -15,6 +15,7 @@ import (
 	"github.com/briqt/kiro-think/internal/config"
 	"github.com/briqt/kiro-think/internal/daemon"
 	"github.com/briqt/kiro-think/internal/proxy"
+	"github.com/briqt/kiro-think/internal/setup"
 )
 
 var (
@@ -29,7 +30,39 @@ func main() {
 		os.Exit(1)
 	}
 
-	switch os.Args[1] {
+	cmd := os.Args[1]
+
+	// Commands that don't need init
+	switch cmd {
+	case "version":
+		fmt.Printf("kiro-think %s (commit: %s, built: %s)\n", version, commit, date)
+		return
+	case "help", "-h", "--help":
+		usage()
+		return
+	case "init":
+		if err := setup.AutoInit(); err != nil {
+			fmt.Fprintf(os.Stderr, "init error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	case "setup":
+		if err := setup.InteractiveSetup(); err != nil {
+			fmt.Fprintf(os.Stderr, "setup error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// All other commands: auto-init on first run
+	if !setup.IsInitialized() {
+		if err := setup.AutoInit(); err != nil {
+			fmt.Fprintf(os.Stderr, "init error: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	switch cmd {
 	case "start":
 		if err := daemon.Start(); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -52,16 +85,10 @@ func main() {
 		cmdLevel()
 	case "run-kiro":
 		cmdRunKiro()
-	case "setup":
-		cmdSetup()
 	case "run":
 		cmdRun()
-	case "version":
-		fmt.Printf("kiro-think %s (commit: %s, built: %s)\n", version, commit, date)
-	case "help", "-h", "--help":
-		usage()
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command: %s\n", os.Args[1])
+		fmt.Fprintf(os.Stderr, "unknown command: %s\n", cmd)
 		usage()
 		os.Exit(1)
 	}
@@ -79,8 +106,9 @@ Commands:
   restart         Restart the proxy daemon
   status          Show proxy status
   level [LEVEL]   Get or set thinking level (low/medium/high/xhigh/max)
-  run-kiro        Launch kiro-cli through the proxy (auto-sets env vars)
-  setup           Interactive first-time setup (config, certs, alias, start)
+  run-kiro        Launch kiro-cli through the proxy (auto-starts daemon)
+  init            Auto-initialize (config, certs, alias) with defaults
+  setup           Interactive reconfiguration
   run             Run proxy in foreground (for debugging)
   version         Show version info
   help            Show this help
@@ -114,7 +142,6 @@ func cmdLevel() {
 	}
 
 	if len(os.Args) < 3 {
-		// Show current level
 		fmt.Printf("level:  %s\n", cfg.Thinking.Level)
 		fmt.Printf("budget: %d\n", cfg.Thinking.Budget)
 		fmt.Printf("mode:   %s\n", cfg.Thinking.Mode)
@@ -147,7 +174,6 @@ func cmdLevel() {
 	}
 	fmt.Printf("level set to %s (budget: %d)\n", level, cfg.Thinking.Budget)
 
-	// Hot-reload running daemon
 	if err := daemon.SendHUP(); err == nil {
 		fmt.Println("daemon reloaded")
 	}
@@ -165,7 +191,6 @@ func cmdRunKiro() {
 		}
 	}
 
-	// Extract port from listen address
 	port := "8960"
 	if i := strings.LastIndex(cfg.Listen, ":"); i >= 0 {
 		port = cfg.Listen[i+1:]
@@ -174,219 +199,39 @@ func cmdRunKiro() {
 	combinedCA := filepath.Join(config.Dir(), "combined-ca.crt")
 	proxyURL := fmt.Sprintf("http://127.0.0.1:%s", port)
 
-	// Find kiro-cli
 	kiroCli, err := exec.LookPath("kiro-cli")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "kiro-cli not found in PATH\n")
 		os.Exit(1)
 	}
 
-	// Build args: pass through everything after "run-kiro"
 	args := []string{kiroCli, "chat"}
 	if len(os.Args) > 2 {
 		args = append(args, os.Args[2:]...)
 	}
 
 	env := os.Environ()
-	env = append(env,
+	// Remove existing proxy/cert vars to ensure ours take effect
+	filtered := env[:0]
+	for _, e := range env {
+		upper := strings.ToUpper(e)
+		if strings.HasPrefix(upper, "HTTPS_PROXY=") ||
+			strings.HasPrefix(upper, "HTTP_PROXY=") ||
+			strings.HasPrefix(upper, "SSL_CERT_FILE=") {
+			continue
+		}
+		filtered = append(filtered, e)
+	}
+	filtered = append(filtered,
 		"SSL_CERT_FILE="+combinedCA,
 		"HTTPS_PROXY="+proxyURL,
 		"HTTP_PROXY="+proxyURL,
 	)
 
 	fmt.Printf("launching kiro-cli (level: %s, proxy: %s)\n", cfg.Thinking.Level, proxyURL)
-	err = syscall.Exec(kiroCli, args, env)
-	if err != nil {
+	if err := syscall.Exec(kiroCli, args, filtered); err != nil {
 		fmt.Fprintf(os.Stderr, "exec kiro-cli: %v\n", err)
 		os.Exit(1)
-	}
-}
-
-func cmdSetup() {
-	fmt.Println("🧠 kiro-think setup")
-	fmt.Println()
-
-	// Resolve absolute path of this binary
-	exePath, _ := os.Executable()
-	exePath, _ = filepath.EvalSymlinks(exePath)
-	absExe, err := filepath.Abs(exePath)
-	if err == nil {
-		exePath = absExe
-	}
-
-	cfg := config.Default()
-
-	// If config already exists, ask whether to reconfigure
-	if _, err := os.Stat(config.Path()); err == nil {
-		existing, _ := config.Load()
-		if existing != nil {
-			if !askYN("Config already exists at "+config.Path()+". Reconfigure?", false) {
-				cfg = existing
-				goto skipConfig
-			}
-			cfg = existing
-		}
-	}
-
-	// Step 1: Listen port
-	{
-		port := prompt("Listen port", "8960")
-		cfg.Listen = ":" + port
-	}
-
-	// Step 2: Upstream proxy
-	{
-		fmt.Println()
-		fmt.Println("Upstream proxy (if you use a proxy to access the internet).")
-		fmt.Println("Leave empty for direct connection (most users).")
-		cfg.Upstream = prompt("Upstream proxy (host:port)", cfg.Upstream)
-	}
-
-	// Step 3: Thinking level
-	{
-		fmt.Println()
-		fmt.Println("Thinking levels:")
-		levels := []string{"low", "medium", "high", "xhigh", "max"}
-		for _, l := range levels {
-			fmt.Printf("  %-8s %d tokens\n", l, config.ThinkingLevels[l])
-		}
-		level := prompt("Default thinking level", "max")
-		if !cfg.SetLevel(level) {
-			fmt.Printf("  invalid level %q, using max\n", level)
-			cfg.SetLevel("max")
-		}
-	}
-
-	// Step 4: Thinking mode
-	{
-		fmt.Println()
-		fmt.Println("Thinking mode:")
-		fmt.Println("  enabled   - fixed budget tokens (recommended)")
-		fmt.Println("  adaptive  - effort-based, model decides depth")
-		mode := prompt("Thinking mode", "enabled")
-		if mode == "adaptive" || mode == "enabled" {
-			cfg.Thinking.Mode = mode
-		} else {
-			fmt.Printf("  invalid mode %q, using enabled\n", mode)
-			cfg.Thinking.Mode = "enabled"
-		}
-	}
-
-	// Save config
-	if err := config.Save(cfg); err != nil {
-		fmt.Fprintf(os.Stderr, "error saving config: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Printf("\n✅ Config saved to %s\n", config.Path())
-
-skipConfig:
-	// Step 5: Generate CA cert
-	fmt.Println()
-	fmt.Println("Generating CA certificate...")
-	if _, err := cert.NewManager(); err != nil {
-		fmt.Fprintf(os.Stderr, "error generating cert: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Printf("✅ CA cert: %s\n", filepath.Join(config.Dir(), "ca.crt"))
-	fmt.Printf("✅ Combined CA: %s\n", filepath.Join(config.Dir(), "combined-ca.crt"))
-
-	// Step 6: Shell alias
-	fmt.Println()
-	shell := detectShell()
-	rcFile := shellRC(shell)
-	aliasLine := fmt.Sprintf("alias kiro='%s run-kiro'", exePath)
-
-	if rcFile != "" {
-		// Check if alias already exists
-		if content, err := os.ReadFile(rcFile); err == nil && strings.Contains(string(content), "kiro-think") {
-			fmt.Printf("✅ Shell alias already configured in %s\n", rcFile)
-		} else if askYN(fmt.Sprintf("Add alias to %s?", rcFile), true) {
-			f, err := os.OpenFile(rcFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "  error: %v\n", err)
-			} else {
-				fmt.Fprintf(f, "\n# kiro-think: launch kiro-cli with thinking injection\n%s\n", aliasLine)
-				f.Close()
-				fmt.Printf("✅ Alias added to %s\n", rcFile)
-				fmt.Printf("   Run: source %s\n", rcFile)
-			}
-		}
-	} else {
-		fmt.Println("Could not detect shell rc file. Add this manually:")
-		fmt.Printf("  %s\n", aliasLine)
-	}
-
-	// Step 7: Start daemon
-	fmt.Println()
-	if askYN("Start the proxy now?", true) {
-		if pid, running := daemon.IsRunning(); running {
-			fmt.Printf("✅ Already running (pid %d)\n", pid)
-		} else if err := daemon.Start(); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		} else {
-			fmt.Println("✅ Proxy started")
-		}
-	}
-
-	// Done
-	fmt.Println()
-	fmt.Println("🎉 Setup complete! Usage:")
-	fmt.Println()
-	fmt.Println("  kiro                    # launch kiro-cli with thinking injection")
-	fmt.Println("  kiro-think level max    # change thinking level")
-	fmt.Println("  kiro-think status       # check proxy status")
-}
-
-func prompt(label, defaultVal string) string {
-	if defaultVal != "" {
-		fmt.Printf("%s [%s]: ", label, defaultVal)
-	} else {
-		fmt.Printf("%s: ", label)
-	}
-	var input string
-	fmt.Scanln(&input)
-	input = strings.TrimSpace(input)
-	if input == "" {
-		return defaultVal
-	}
-	return input
-}
-
-func askYN(question string, defaultYes bool) bool {
-	hint := "[y/N]"
-	if defaultYes {
-		hint = "[Y/n]"
-	}
-	fmt.Printf("%s %s ", question, hint)
-	var input string
-	fmt.Scanln(&input)
-	input = strings.TrimSpace(strings.ToLower(input))
-	if input == "" {
-		return defaultYes
-	}
-	return input == "y" || input == "yes"
-}
-
-func detectShell() string {
-	shell := os.Getenv("SHELL")
-	if strings.Contains(shell, "zsh") {
-		return "zsh"
-	}
-	if strings.Contains(shell, "fish") {
-		return "fish"
-	}
-	return "bash"
-}
-
-func shellRC(shell string) string {
-	home, _ := os.UserHomeDir()
-	switch shell {
-	case "zsh":
-		return filepath.Join(home, ".zshrc")
-	case "fish":
-		return filepath.Join(home, ".config", "fish", "config.fish")
-	default:
-		return filepath.Join(home, ".bashrc")
 	}
 }
 
@@ -405,7 +250,6 @@ func cmdRun() {
 	daemon.WritePidSelf()
 	defer daemon.RemovePid()
 
-	// Handle SIGHUP for config reload
 	sighup := make(chan os.Signal, 1)
 	signal.Notify(sighup, syscall.SIGHUP)
 	go func() {
@@ -419,7 +263,6 @@ func cmdRun() {
 		}
 	}()
 
-	// Handle SIGTERM/SIGINT for graceful shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
 	go func() {

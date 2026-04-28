@@ -2,13 +2,13 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"strings"
 	"sync/atomic"
 
@@ -176,26 +176,25 @@ func (s *Server) forwardRequest(clientConn net.Conn, req *http.Request, host str
 	req.URL.Scheme = "https"
 	req.URL.Host = host
 	req.RequestURI = ""
+	req.Body = io.NopCloser(bytes.NewReader(body))
 
 	if err := req.Write(tlsUp); err != nil {
 		tlsUp.Close()
 		return
 	}
-	tlsUp.Write(body)
 
 	upResp, err := http.ReadResponse(bufio.NewReader(tlsUp), req)
 	if err != nil {
 		tlsUp.Close()
+		log.Printf("response read error: %v", err)
 		return
 	}
-	defer upResp.Body.Close()
 
-	respBody, _ := io.ReadAll(upResp.Body)
-	log.Printf("← %d (%dB) %s", upResp.StatusCode, len(respBody), target)
-
-	respBytes, _ := httputil.DumpResponse(upResp, false)
-	clientConn.Write(respBytes)
-	clientConn.Write(respBody)
+	// Write response headers
+	if err := upResp.Write(clientConn); err != nil {
+		log.Printf("response write error: %v", err)
+	}
+	log.Printf("← %d %s", upResp.StatusCode, target)
 	tlsUp.Close()
 }
 
