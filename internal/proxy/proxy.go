@@ -17,7 +17,6 @@ import (
 	"github.com/briqt/kiro-think/internal/inject"
 )
 
-// Server is the MITM proxy server.
 type Server struct {
 	cfg      atomic.Pointer[config.Config]
 	certMgr  *cert.Manager
@@ -30,7 +29,6 @@ func New(cfg *config.Config, certMgr *cert.Manager) *Server {
 	return s
 }
 
-// Reload updates the running config (called on SIGHUP).
 func (s *Server) Reload(cfg *config.Config) {
 	s.cfg.Store(cfg)
 	log.Printf("config reloaded: level=%s budget=%d mode=%s",
@@ -43,7 +41,12 @@ func (s *Server) ListenAndServe(addr string) error {
 		return err
 	}
 	s.listener = ln
-	log.Printf("listening on %s", addr)
+	cfg := s.cfg.Load()
+	if cfg.Upstream == "" {
+		log.Printf("listening on %s (direct mode)", addr)
+	} else {
+		log.Printf("listening on %s (upstream: %s)", addr, cfg.Upstream)
+	}
 	srv := &http.Server{Handler: http.HandlerFunc(s.handleHTTP)}
 	return srv.Serve(ln)
 }
@@ -52,6 +55,29 @@ func (s *Server) Close() {
 	if s.listener != nil {
 		s.listener.Close()
 	}
+}
+
+// dialRemote connects to host:port either directly or via upstream proxy.
+func (s *Server) dialRemote(hostport string, cfg *config.Config) (net.Conn, error) {
+	if cfg.Upstream == "" {
+		return net.Dial("tcp", hostport)
+	}
+	// Via upstream CONNECT
+	upConn, err := net.Dial("tcp", cfg.Upstream)
+	if err != nil {
+		return nil, fmt.Errorf("upstream dial: %w", err)
+	}
+	fmt.Fprintf(upConn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", hostport, hostport)
+	resp, err := http.ReadResponse(bufio.NewReader(upConn), nil)
+	if err != nil {
+		upConn.Close()
+		return nil, fmt.Errorf("upstream CONNECT: %w", err)
+	}
+	if resp.StatusCode != 200 {
+		upConn.Close()
+		return nil, fmt.Errorf("upstream CONNECT: %s", resp.Status)
+	}
+	return upConn, nil
 }
 
 func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
@@ -82,14 +108,12 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !isTarget {
-		// Plain tunnel through upstream
 		s.tunnel(clientConn, r.Host, cfg)
 		return
 	}
 
 	// MITM: TLS terminate, inspect, forward
 	clientConn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
-
 	tlsConn := tls.Server(clientConn, &tls.Config{
 		GetCertificate: s.certMgr.GetCertificate,
 	})
@@ -98,7 +122,6 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Read HTTP requests from decrypted connection
 	br := bufio.NewReader(tlsConn)
 	for {
 		req, err := http.ReadRequest(br)
@@ -120,43 +143,32 @@ func (s *Server) isTarget(host string, cfg *config.Config) bool {
 }
 
 func (s *Server) forwardRequest(clientConn net.Conn, req *http.Request, host string, cfg *config.Config) {
-	// Read request body
 	body, _ := io.ReadAll(req.Body)
 	req.Body.Close()
 
-	// Inject thinking tags if this is a GenerateAssistantResponse request
+	// Inject thinking tags
 	target := req.Header.Get("X-Amz-Target")
-	injected := false
 	if strings.Contains(target, "GenerateAssistantResponse") {
-		body, injected = inject.InjectThinking(body, cfg.Thinking)
-		if injected {
+		if newBody, ok := inject.InjectThinking(body, cfg.Thinking); ok {
+			body = newBody
 			log.Printf("💉 injected: %s", inject.GeneratePrefix(cfg.Thinking))
 		}
 	}
 
-	// Connect to upstream via CONNECT tunnel
-	upConn, err := net.Dial("tcp", cfg.Upstream)
+	// Connect to target
+	rawConn, err := s.dialRemote(host+":443", cfg)
 	if err != nil {
-		log.Printf("upstream dial error: %v", err)
-		return
-	}
-	fmt.Fprintf(upConn, "CONNECT %s:443 HTTP/1.1\r\nHost: %s:443\r\n\r\n", host, host)
-	resp, err := http.ReadResponse(bufio.NewReader(upConn), nil)
-	if err != nil || resp.StatusCode != 200 {
-		upConn.Close()
-		log.Printf("upstream CONNECT failed")
+		log.Printf("dial error: %v", err)
 		return
 	}
 
-	// TLS to upstream
-	tlsUp := tls.Client(upConn, &tls.Config{ServerName: host})
+	tlsUp := tls.Client(rawConn, &tls.Config{ServerName: host})
 	if err := tlsUp.Handshake(); err != nil {
-		upConn.Close()
-		log.Printf("upstream TLS error: %v", err)
+		rawConn.Close()
+		log.Printf("TLS error: %v", err)
 		return
 	}
 
-	// Remove accept-encoding to get uncompressed response
 	req.Header.Del("Accept-Encoding")
 	req.ContentLength = int64(len(body))
 	req.Header.Set("Content-Length", fmt.Sprintf("%d", len(body)))
@@ -165,14 +177,12 @@ func (s *Server) forwardRequest(clientConn net.Conn, req *http.Request, host str
 	req.URL.Host = host
 	req.RequestURI = ""
 
-	// Send request
 	if err := req.Write(tlsUp); err != nil {
 		tlsUp.Close()
 		return
 	}
 	tlsUp.Write(body)
 
-	// Read response and forward to client
 	upResp, err := http.ReadResponse(bufio.NewReader(tlsUp), req)
 	if err != nil {
 		tlsUp.Close()
@@ -183,7 +193,6 @@ func (s *Server) forwardRequest(clientConn net.Conn, req *http.Request, host str
 	respBody, _ := io.ReadAll(upResp.Body)
 	log.Printf("← %d (%dB) %s", upResp.StatusCode, len(respBody), target)
 
-	// Write response back to client
 	respBytes, _ := httputil.DumpResponse(upResp, false)
 	clientConn.Write(respBytes)
 	clientConn.Write(respBody)
@@ -191,36 +200,26 @@ func (s *Server) forwardRequest(clientConn net.Conn, req *http.Request, host str
 }
 
 func (s *Server) tunnel(clientConn net.Conn, target string, cfg *config.Config) {
-	upConn, err := net.Dial("tcp", cfg.Upstream)
+	remoteConn, err := s.dialRemote(target, cfg)
 	if err != nil {
 		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		clientConn.Close()
 		return
 	}
-	fmt.Fprintf(upConn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target)
-	resp, err := http.ReadResponse(bufio.NewReader(upConn), nil)
-	if err != nil || resp.StatusCode != 200 {
-		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
-		clientConn.Close()
-		upConn.Close()
-		return
-	}
 	clientConn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
-	go io.Copy(upConn, clientConn)
-	io.Copy(clientConn, upConn)
+	go io.Copy(remoteConn, clientConn)
+	io.Copy(clientConn, remoteConn)
 	clientConn.Close()
-	upConn.Close()
+	remoteConn.Close()
 }
 
 func (s *Server) handlePlain(w http.ResponseWriter, r *http.Request) {
-	cfg := s.cfg.Load()
 	resp, err := http.DefaultTransport.(*http.Transport).RoundTrip(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
-	_ = cfg // plain HTTP just forwards
 	for k, vv := range resp.Header {
 		for _, v := range vv {
 			w.Header().Add(k, v)

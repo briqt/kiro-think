@@ -54,7 +54,7 @@ func expandPath(p string) string {
 func Default() *Config {
 	return &Config{
 		Listen:   ":8960",
-		Upstream: "127.0.0.1:3067",
+		Upstream: "",
 		Thinking: ThinkingConfig{
 			Mode:   "enabled",
 			Level:  "max",

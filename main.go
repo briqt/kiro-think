@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
@@ -48,6 +50,10 @@ func main() {
 		cmdStatus()
 	case "level":
 		cmdLevel()
+	case "run-kiro":
+		cmdRunKiro()
+	case "setup":
+		cmdSetup()
 	case "run":
 		cmdRun()
 	case "version":
@@ -73,13 +79,11 @@ Commands:
   restart         Restart the proxy daemon
   status          Show proxy status
   level [LEVEL]   Get or set thinking level (low/medium/high/xhigh/max)
-  run             Run in foreground (for debugging)
+  run-kiro        Launch kiro-cli through the proxy (auto-sets env vars)
+  setup           Print shell alias for easy kiro-cli launching
+  run             Run proxy in foreground (for debugging)
   version         Show version info
   help            Show this help
-
-Environment:
-  SSL_CERT_FILE=~/.kiro-think/combined-ca.crt
-  HTTPS_PROXY=http://127.0.0.1:8960
 `)
 }
 
@@ -92,7 +96,11 @@ func cmdStatus() {
 		fmt.Println("status:   stopped")
 	}
 	fmt.Printf("listen:   %s\n", cfg.Listen)
-	fmt.Printf("upstream: %s\n", cfg.Upstream)
+	upstream := cfg.Upstream
+	if upstream == "" {
+		upstream = "(direct)"
+	}
+	fmt.Printf("upstream: %s\n", upstream)
 	fmt.Printf("mode:     %s\n", cfg.Thinking.Mode)
 	fmt.Printf("level:    %s\n", cfg.Thinking.Level)
 	fmt.Printf("budget:   %d\n", cfg.Thinking.Budget)
@@ -143,6 +151,79 @@ func cmdLevel() {
 	if err := daemon.SendHUP(); err == nil {
 		fmt.Println("daemon reloaded")
 	}
+}
+
+func cmdRunKiro() {
+	cfg, _ := config.Load()
+
+	// Auto-start daemon if not running
+	if _, running := daemon.IsRunning(); !running {
+		fmt.Println("starting proxy...")
+		if err := daemon.Start(); err != nil {
+			fmt.Fprintf(os.Stderr, "error starting proxy: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	// Extract port from listen address
+	port := "8960"
+	if i := strings.LastIndex(cfg.Listen, ":"); i >= 0 {
+		port = cfg.Listen[i+1:]
+	}
+
+	combinedCA := filepath.Join(config.Dir(), "combined-ca.crt")
+	proxyURL := fmt.Sprintf("http://127.0.0.1:%s", port)
+
+	// Find kiro-cli
+	kiroCli, err := exec.LookPath("kiro-cli")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "kiro-cli not found in PATH\n")
+		os.Exit(1)
+	}
+
+	// Build args: pass through everything after "run-kiro"
+	args := []string{kiroCli, "chat"}
+	if len(os.Args) > 2 {
+		args = append(args, os.Args[2:]...)
+	}
+
+	env := os.Environ()
+	env = append(env,
+		"SSL_CERT_FILE="+combinedCA,
+		"HTTPS_PROXY="+proxyURL,
+		"HTTP_PROXY="+proxyURL,
+	)
+
+	fmt.Printf("launching kiro-cli (level: %s, proxy: %s)\n", cfg.Thinking.Level, proxyURL)
+	err = syscall.Exec(kiroCli, args, env)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "exec kiro-cli: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func cmdSetup() {
+	cfg, _ := config.Load()
+	port := "8960"
+	if i := strings.LastIndex(cfg.Listen, ":"); i >= 0 {
+		port = cfg.Listen[i+1:]
+	}
+
+	exePath, _ := os.Executable()
+	combinedCA := filepath.Join(config.Dir(), "combined-ca.crt")
+	proxyURL := fmt.Sprintf("http://127.0.0.1:%s", port)
+
+	fmt.Println("# Add this to your ~/.bashrc or ~/.zshrc:")
+	fmt.Println()
+	fmt.Printf("alias kiro='%s run-kiro'\n", exePath)
+	fmt.Println()
+	fmt.Println("# Or if you prefer manual env vars:")
+	fmt.Println()
+	fmt.Printf("export SSL_CERT_FILE=\"%s\"\n", combinedCA)
+	fmt.Printf("export HTTPS_PROXY=\"%s\"\n", proxyURL)
+	fmt.Printf("export HTTP_PROXY=\"%s\"\n", proxyURL)
+	fmt.Println()
+	fmt.Println("# Then just run: kiro-cli chat")
 }
 
 func cmdRun() {

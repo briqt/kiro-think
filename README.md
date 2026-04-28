@@ -23,10 +23,8 @@ Kiro CLI uses an internal AWS API (`GenerateAssistantResponse`) for chat. The th
 ## Prerequisites
 
 - **Go 1.24+** (for building from source) or download a pre-built binary
-- **An upstream HTTP proxy** that Kiro CLI already uses (default: `127.0.0.1:3067`). kiro-think sits between Kiro CLI and your existing proxy — it does not replace it.
-- **Kiro CLI** configured to use `HTTPS_PROXY`
-
-> If you don't use an upstream proxy, set `"upstream"` in config to the empty string `""` and kiro-think will connect directly. *(not yet implemented — contributions welcome)*
+- **Kiro CLI** installed and logged in
+- **(Optional)** An upstream HTTP proxy — if you already use one (e.g. for VPN/corporate network), set `"upstream"` in config. By default kiro-think connects directly to AWS.
 
 ## Install
 
@@ -43,18 +41,32 @@ Download from [Releases](https://github.com/briqt/kiro-think/releases), extract,
 ## Quick Start
 
 ```bash
-# 1. Start the proxy (generates CA cert and config on first run)
+# 1. Install
+go install github.com/briqt/kiro-think@latest
+
+# 2. Start the proxy (generates CA cert and config on first run)
 kiro-think start
 
-# 2. Launch kiro-cli through the proxy
-SSL_CERT_FILE=~/.kiro-think/combined-ca.crt \
-HTTPS_PROXY=http://127.0.0.1:8960 \
-HTTP_PROXY=http://127.0.0.1:8960 \
-kiro-cli chat
-
-# Or use the helper script (reads port from config automatically):
-scripts/kiro-cli-proxy.sh
+# 3. Launch kiro-cli through the proxy (one command!)
+kiro-think run-kiro
 ```
+
+That's it. `run-kiro` auto-starts the daemon if needed, sets the correct environment variables, and launches `kiro-cli chat`.
+
+### Permanent setup
+
+```bash
+# Print a shell alias you can add to ~/.bashrc or ~/.zshrc
+kiro-think setup
+```
+
+This outputs something like:
+
+```bash
+alias kiro='kiro-think run-kiro'
+```
+
+After adding it, just type `kiro` to start Kiro CLI with thinking injection.
 
 ### Why `SSL_CERT_FILE`?
 
@@ -72,7 +84,9 @@ This only affects processes launched with `SSL_CERT_FILE` set — your system an
 | `kiro-think status` | Show status, current level, PID |
 | `kiro-think level` | Show current thinking level |
 | `kiro-think level <LEVEL>` | Set thinking level (hot-reload via SIGHUP) |
-| `kiro-think run` | Run in foreground (for debugging) |
+| `kiro-think run-kiro [args]` | Launch kiro-cli through the proxy (auto-starts daemon) |
+| `kiro-think setup` | Print shell alias for permanent setup |
+| `kiro-think run` | Run proxy in foreground (for debugging) |
 | `kiro-think version` | Show version info |
 
 ## Thinking Levels
@@ -100,7 +114,7 @@ Config file: `~/.kiro-think/config.json` (auto-generated on first run)
 ```json
 {
   "listen": ":8960",
-  "upstream": "127.0.0.1:3067",
+  "upstream": "",
   "thinking": {
     "mode": "enabled",
     "level": "max",
@@ -116,7 +130,7 @@ Config file: `~/.kiro-think/config.json` (auto-generated on first run)
 | Field | Description |
 |-------|-------------|
 | `listen` | Proxy listen address (e.g. `:8960` or `127.0.0.1:8960`) |
-| `upstream` | Upstream HTTP proxy address (host:port) |
+| `upstream` | Upstream HTTP proxy (empty = direct connection, no proxy needed) |
 | `thinking.mode` | `"enabled"` (fixed budget) or `"adaptive"` (effort-based) |
 | `thinking.level` | Effort level: `low` / `medium` / `high` / `xhigh` / `max` |
 | `thinking.budget` | Budget tokens (auto-set when changing level) |
