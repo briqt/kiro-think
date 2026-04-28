@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/briqt/kiro-think/internal/cert"
 	"github.com/briqt/kiro-think/internal/config"
@@ -183,18 +184,33 @@ func (s *Server) forwardRequest(clientConn net.Conn, req *http.Request, host str
 		return
 	}
 
-	upResp, err := http.ReadResponse(bufio.NewReader(tlsUp), req)
-	if err != nil {
-		tlsUp.Close()
-		log.Printf("response read error: %v", err)
-		return
+	// For chat requests: raw-pipe entire TLS stream to preserve chunked/event-stream
+	// encoding, while teeing to capture token info.
+	// For other requests: use http.ReadResponse for clean handling.
+	if strings.Contains(target, "GenerateAssistantResponse") {
+		var captured bytes.Buffer
+		buf := make([]byte, 32*1024)
+		// Set read deadline: if no data for 5s after last read, assume stream ended
+		for {
+			tlsUp.SetReadDeadline(time.Now().Add(5 * time.Second))
+			n, readErr := tlsUp.Read(buf)
+			if n > 0 {
+				clientConn.Write(buf[:n])
+				captured.Write(buf[:n])
+			}
+			if readErr != nil {
+				break
+			}
+		}
+		usage := extractUsageFromEventStream(captured.Bytes())
+		log.Printf("← (%dB→%dB) %s | %s", len(body), captured.Len(), target, usage)
+	} else {
+		upResp, err := http.ReadResponse(bufio.NewReader(tlsUp), req)
+		if err == nil {
+			upResp.Write(clientConn)
+			log.Printf("← %d %s", upResp.StatusCode, target)
+		}
 	}
-
-	// Write response headers
-	if err := upResp.Write(clientConn); err != nil {
-		log.Printf("response write error: %v", err)
-	}
-	log.Printf("← %d %s", upResp.StatusCode, target)
 	tlsUp.Close()
 }
 
@@ -210,6 +226,42 @@ func (s *Server) tunnel(clientConn net.Conn, target string, cfg *config.Config) 
 	io.Copy(clientConn, remoteConn)
 	clientConn.Close()
 	remoteConn.Close()
+}
+
+// extractUsageFromEventStream scans AWS Event Stream binary data for
+// contextUsagePercentage and modelId fields embedded in JSON payloads.
+func extractUsageFromEventStream(data []byte) string {
+	s := string(data)
+	var parts []string
+
+	// Extract contextUsagePercentage
+	if i := strings.Index(s, `"contextUsagePercentage"`); i >= 0 {
+		// Find the number after the colon
+		sub := s[i:]
+		if ci := strings.Index(sub, ":"); ci >= 0 {
+			numStart := ci + 1
+			for numStart < len(sub) && (sub[numStart] == ' ' || sub[numStart] == '\t') {
+				numStart++
+			}
+			numEnd := numStart
+			for numEnd < len(sub) && (sub[numEnd] == '.' || (sub[numEnd] >= '0' && sub[numEnd] <= '9')) {
+				numEnd++
+			}
+			if numEnd > numStart {
+				parts = append(parts, "context="+sub[numStart:numEnd]+"%")
+			}
+		}
+	}
+
+	// Extract modelId
+	if i := strings.Index(s, `"modelId":"`); i >= 0 {
+		sub := s[i+len(`"modelId":"`):]
+		if end := strings.Index(sub, `"`); end >= 0 {
+			parts = append(parts, "model="+sub[:end])
+		}
+	}
+
+	return strings.Join(parts, " ")
 }
 
 func (s *Server) handlePlain(w http.ResponseWriter, r *http.Request) {
