@@ -7,7 +7,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
@@ -43,8 +43,7 @@ func (s *Server) Reload(cfg *config.Config) {
 		s.transports.Delete(key)
 		return true
 	})
-	log.Printf("config reloaded: level=%s budget=%d mode=%s",
-		cfg.Thinking.Level, cfg.Thinking.Budget, cfg.Thinking.Mode)
+	slog.Info("config reloaded", "level", cfg.Thinking.Level, "budget", cfg.Thinking.Budget, "mode", cfg.Thinking.Mode)
 }
 
 func (s *Server) ListenAndServe(addr string) error {
@@ -55,9 +54,9 @@ func (s *Server) ListenAndServe(addr string) error {
 	s.listener = ln
 	cfg := s.cfg.Load()
 	if cfg.Upstream == "" {
-		log.Printf("listening on %s (direct mode)", addr)
+		slog.Info("listening", "addr", addr, "mode", "direct")
 	} else {
-		log.Printf("listening on %s (upstream: %s)", addr, cfg.Upstream)
+		slog.Info("listening", "addr", addr, "upstream", cfg.Upstream)
 	}
 	srv := &http.Server{Handler: http.HandlerFunc(s.handleHTTP)}
 	return srv.Serve(ln)
@@ -190,9 +189,9 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, host strin
 		var injected bool
 		body, injected, modelID = inject.InjectThinking(body, cfg.Thinking)
 		if injected {
-			log.Printf("💉 [%s] %s", modelID, inject.GeneratePrefix(cfg.Thinking))
+			slog.Info("injected", "model", modelID, "prefix", inject.GeneratePrefix(cfg.Thinking))
 		} else if modelID != "" {
-			log.Printf("⏭️  [%s] skipped (not in whitelist)", modelID)
+			slog.Info("skipped", "model", modelID, "reason", "not in whitelist")
 		}
 	}
 
@@ -214,7 +213,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, host strin
 
 	upResp, err := s.getTransport(host).RoundTrip(upReq)
 	if err != nil {
-		log.Printf("upstream error: %v", err)
+		slog.Error("upstream request failed", "error", err)
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -245,7 +244,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, host strin
 	}
 
 	if cfg.Debug {
-		log.Printf("  [debug] ← %d %s (%dB)", upResp.StatusCode, target, len(body))
+		slog.Debug("response", "status", upResp.StatusCode, "target", target, "bodySize", len(body))
 	}
 }
 

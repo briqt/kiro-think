@@ -67,7 +67,6 @@ func Start() error {
 	if err != nil {
 		return fmt.Errorf("open log file: %w", err)
 	}
-	defer lf.Close()
 
 	cmd := exec.Command(exePath, "run")
 	cmd.Stdout = lf
@@ -75,8 +74,11 @@ func Start() error {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
 	if err := cmd.Start(); err != nil {
+		lf.Close()
 		return err
 	}
+
+	lf.Close()
 
 	writePid(cmd.Process.Pid)
 	fmt.Printf("started (pid %d)\n", cmd.Process.Pid)

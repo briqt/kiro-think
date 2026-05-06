@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -14,6 +14,7 @@ import (
 	"github.com/briqt/kiro-think/internal/cert"
 	"github.com/briqt/kiro-think/internal/config"
 	"github.com/briqt/kiro-think/internal/daemon"
+	"github.com/briqt/kiro-think/internal/logutil"
 	"github.com/briqt/kiro-think/internal/proxy"
 	"github.com/briqt/kiro-think/internal/setup"
 )
@@ -241,12 +242,17 @@ func cmdRunKiro() {
 func cmdRun() {
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("config: %v", err)
+		fmt.Fprintf(os.Stderr, "config: %v\n", err)
+		os.Exit(1)
 	}
+
+	_, cleanup := logutil.Setup(cfg.LogFile)
+	defer cleanup()
 
 	certMgr, err := cert.NewManager()
 	if err != nil {
-		log.Fatalf("cert: %v", err)
+		slog.Error("cert init failed", "error", err)
+		os.Exit(1)
 	}
 
 	srv := proxy.New(cfg, certMgr)
@@ -259,7 +265,7 @@ func cmdRun() {
 		for range sighup {
 			newCfg, err := config.Load()
 			if err != nil {
-				log.Printf("reload config error: %v", err)
+				slog.Error("reload config failed", "error", err)
 				continue
 			}
 			srv.Reload(newCfg)
@@ -270,13 +276,16 @@ func cmdRun() {
 	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
 		<-quit
-		log.Println("shutting down...")
+		slog.Info("shutting down")
 		srv.Close()
 	}()
 
-	log.Printf("kiro-think %s starting: level=%s budget=%d mode=%s",
-		version, cfg.Thinking.Level, cfg.Thinking.Budget, cfg.Thinking.Mode)
+	slog.Info("kiro-think starting",
+		"version", version,
+		"level", cfg.Thinking.Level,
+		"budget", cfg.Thinking.Budget,
+		"mode", cfg.Thinking.Mode)
 	if err := srv.ListenAndServe(cfg.Listen); err != nil {
-		log.Printf("server: %v", err)
+		slog.Error("server stopped", "error", err)
 	}
 }
