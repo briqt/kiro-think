@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"syscall"
@@ -20,10 +21,34 @@ import (
 )
 
 var (
-	version = "dev"
-	commit  = "none"
-	date    = "unknown"
+	version = ""
+	commit  = ""
+	date    = ""
 )
+
+func getVersion() string {
+	if version != "" {
+		return version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
+		return info.Main.Version
+	}
+	return "dev"
+}
+
+func getCommit() string {
+	if commit != "" {
+		return commit
+	}
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, s := range info.Settings {
+			if s.Key == "vcs.revision" && len(s.Value) >= 7 {
+				return s.Value[:7]
+			}
+		}
+	}
+	return "unknown"
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -36,7 +61,7 @@ func main() {
 	// Commands that don't need init
 	switch cmd {
 	case "version":
-		fmt.Printf("kiro-think %s (commit: %s, built: %s)\n", version, commit, date)
+		fmt.Printf("kiro-think %s (commit: %s, built: %s)\n", getVersion(), getCommit(), date)
 		return
 	case "help", "-h", "--help":
 		usage()
@@ -281,7 +306,7 @@ func cmdRun() {
 	}()
 
 	slog.Info("kiro-think starting",
-		"version", version,
+		"version", getVersion(),
 		"level", cfg.Thinking.Level,
 		"budget", cfg.Thinking.Budget,
 		"mode", cfg.Thinking.Mode)
