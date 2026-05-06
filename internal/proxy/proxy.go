@@ -182,8 +182,12 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, host string) {
 	cfg := s.cfg.Load()
 
-	body, _ := io.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	r.Body.Close()
+	if err != nil {
+		http.Error(w, "failed to read request body", http.StatusBadGateway)
+		return
+	}
 
 	target := r.Header.Get("X-Amz-Target")
 	isChat := strings.Contains(target, "GenerateAssistantResponse")
@@ -242,6 +246,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, host strin
 			w.Write(respBody)
 			return
 		}
+		// For chat (stream) errors: log status, then fall through to stream the error body back to client
 		slog.Warn("upstream error (stream)", "status", upResp.StatusCode, "target", target)
 	}
 

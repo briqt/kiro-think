@@ -77,7 +77,7 @@ func InjectThinking(body []byte, tc config.ThinkingConfig, models []string) Inje
 	}
 
 	// Try history first
-	if result, injected := injectInHistory(cs, tc); injected {
+	if result, injected, alreadyTagged := injectInHistory(cs, tc); injected {
 		cs["history"] = result
 		csBytes, _ := json.Marshal(cs)
 		req["conversationState"] = csBytes
@@ -86,6 +86,8 @@ func InjectThinking(body []byte, tc config.ThinkingConfig, models []string) Inje
 			return InjectResult{Body: body, ModelID: modelID, Reason: "marshal_error"}
 		}
 		return InjectResult{Body: out, Done: true, ModelID: modelID}
+	} else if alreadyTagged {
+		return InjectResult{Body: body, ModelID: modelID, Reason: "already_tagged"}
 	}
 
 	// Fallback: inject into currentMessage when history is empty
@@ -100,19 +102,21 @@ func InjectThinking(body []byte, tc config.ThinkingConfig, models []string) Inje
 		return InjectResult{Body: out, Done: true, ModelID: modelID}
 	}
 
-	// If hasThinkingTags returned false in injectIntoContent, it means tags already present
-	return InjectResult{Body: body, ModelID: modelID, Reason: "already_tagged"}
+	// Neither history nor currentMessage could be injected
+	return InjectResult{Body: body, ModelID: modelID, Reason: "no_injection_target"}
 }
 
 // injectInHistory injects into the first user message in history.
-func injectInHistory(cs map[string]json.RawMessage, tc config.ThinkingConfig) (json.RawMessage, bool) {
+// Returns (result, true) on success, (nil, false) if history is empty/missing,
+// or (body, false) with non-nil body if tags already present (should not fallback).
+func injectInHistory(cs map[string]json.RawMessage, tc config.ThinkingConfig) (json.RawMessage, bool, bool) {
 	histRaw, ok := cs["history"]
 	if !ok {
-		return nil, false
+		return nil, false, false
 	}
 	var history []json.RawMessage
 	if err := json.Unmarshal(histRaw, &history); err != nil || len(history) == 0 {
-		return nil, false
+		return nil, false, false
 	}
 
 	for i, msgRaw := range history {
@@ -126,20 +130,21 @@ func injectInHistory(cs map[string]json.RawMessage, tc config.ThinkingConfig) (j
 		}
 		var uim map[string]json.RawMessage
 		if err := json.Unmarshal(uimRaw, &uim); err != nil {
-			return nil, false
+			return nil, false, true
 		}
 		contentRaw, ok := uim["content"]
 		if !ok {
-			return nil, false
+			return nil, false, true
 		}
 		var content string
 		if err := json.Unmarshal(contentRaw, &content); err != nil {
-			return nil, false
+			return nil, false, true
 		}
 
 		newContent, injected := injectIntoContent(content, tc)
 		if !injected {
-			return nil, false
+			// Tags already present — do not fallback
+			return nil, false, true
 		}
 
 		contentBytes, _ := json.Marshal(newContent)
@@ -150,9 +155,9 @@ func injectInHistory(cs map[string]json.RawMessage, tc config.ThinkingConfig) (j
 		history[i] = msgBytes
 
 		histBytes, _ := json.Marshal(history)
-		return histBytes, true
+		return histBytes, true, false
 	}
-	return nil, false
+	return nil, false, false
 }
 
 // injectInCurrentMessage injects into currentMessage.userInputMessage.content.
