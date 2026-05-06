@@ -39,3 +39,9 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Warm Go module proxy cache
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          curl -sf "https://proxy.golang.org/github.com/briqt/kiro-think/@v/${VERSION}.info" > /dev/null
+          echo "Go proxy cache warmed for ${VERSION}"
