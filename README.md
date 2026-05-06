@@ -15,7 +15,7 @@ kiro-cli ──h2──→ :8960 (kiro-think) ──h2──→ upstream proxy �
                        │
                        ├─ MITM with full HTTP/2 support (ALPN h2)
                        ├─ Intercept GenerateAssistantResponse
-                       ├─ Inject <thinking>enabled</thinking><budget>24576</budget>
+                       ├─ Inject <thinking_mode>enabled</thinking_mode><max_thinking_length>24576</max_thinking_length>
                        └─ Forward modified request (other requests pass through untouched)
 ```
 
@@ -125,7 +125,14 @@ Config file: `~/.kiro-think/config.json` (auto-generated on first run)
   },
   "log_file": "~/.kiro-think/kiro-think.log",
   "targets": [
-    "q.us-east-1.amazonaws.com"
+    "q.*.amazonaws.com"
+  ],
+  "models": [
+    "claude-sonnet-4.5",
+    "claude-sonnet-4.6",
+    "claude-opus-4.5",
+    "claude-opus-4.6",
+    "claude-opus-4.7"
   ]
 }
 ```
@@ -138,7 +145,8 @@ Config file: `~/.kiro-think/config.json` (auto-generated on first run)
 | `thinking.level` | Effort level: `low` / `medium` / `high` / `xhigh` / `max` |
 | `thinking.budget` | Budget tokens (auto-set when changing level) |
 | `log_file` | Log file path (`~` is expanded) |
-| `targets` | Hostnames to intercept; all others are tunneled through untouched |
+| `targets` | Hostnames to intercept (supports `*` wildcard for one DNS label); all others are tunneled through untouched |
+| `models` | Model IDs to inject thinking for; empty list = inject for all models |
 
 ## Files
 
@@ -183,7 +191,7 @@ Another process is using port 8960. Check with `ss -tlnp | grep 8960` or change 
 
 ### Thinking injection not working
 
-- Check logs for `💉 injected:` messages
+- Check logs for `msg=injected` messages
 - Verify `chat.enableThinking` is `true`: `kiro-cli settings chat.enableThinking`
 - Ensure `targets` in config includes the correct AWS endpoint
 
@@ -197,17 +205,17 @@ Another process is using port 8960. Check with `ss -tlnp | grep 8960` or change 
 
 The Kiro API controls thinking via XML tags prepended to the system message in `conversationState.history`:
 
-- **Enabled mode**: `<thinking>enabled</thinking><budget>24576</budget>`
-- **Adaptive mode**: `<thinking>adaptive</thinking><effort>high</effort>`
+- **Enabled mode**: `<thinking_mode>enabled</thinking_mode><max_thinking_length>24576</max_thinking_length>`
+- **Adaptive mode**: `<thinking_mode>adaptive</thinking_mode><thinking_effort>high</thinking_effort>`
 
 This proxy:
 1. Intercepts HTTPS CONNECT requests and checks if the hostname is in `targets`
 2. For target hosts: terminates TLS with a dynamically generated certificate, negotiating **h2** or **http/1.1** via ALPN
 3. Serves the MITM'd connection using `http2.Server.ServeConn` (h2) or `http.Server` (h1)
 4. Identifies `GenerateAssistantResponse` by the `x-amz-target` header
-5. Parses the JSON body, finds the first user message in `conversationState.history`
-6. Strips existing `<thinking>`, `<budget>`, `<effort>` tags and prepends the configured tags
-7. Forwards via a shared `http.Transport` with h2 ALPN and connection pooling to the upstream
+5. Parses the JSON body, finds the first user message in `conversationState.history` (or falls back to `currentMessage` on first turn)
+6. Skips if `<thinking_mode>` tags already present; otherwise strips old tags and prepends the configured tags
+7. Forwards via a shared `http.Transport` with h2 ALPN, connection pooling, and 720s timeout to the upstream
 
 ## Acknowledgments
 

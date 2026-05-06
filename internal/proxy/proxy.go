@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/net/http2"
 
@@ -75,9 +76,11 @@ func (s *Server) getTransport(host string) *http.Transport {
 	}
 	cfg := s.cfg.Load()
 	t := &http.Transport{
-		TLSClientConfig:   &tls.Config{ServerName: host},
-		ForceAttemptHTTP2:  true,
-		DisableCompression: true,
+		TLSClientConfig:       &tls.Config{ServerName: host},
+		ForceAttemptHTTP2:     true,
+		DisableCompression:    true,
+		ResponseHeaderTimeout: 720 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
 	}
 	if cfg.Upstream != "" {
 		t.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -186,12 +189,13 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, host strin
 	isChat := strings.Contains(target, "GenerateAssistantResponse")
 	var modelID string
 	if isChat {
-		var injected bool
-		body, injected, modelID = inject.InjectThinking(body, cfg.Thinking)
-		if injected {
-			slog.Info("injected", "model", modelID, "prefix", inject.GeneratePrefix(cfg.Thinking))
-		} else if modelID != "" {
-			slog.Info("skipped", "model", modelID, "reason", "not in whitelist")
+		res := inject.InjectThinking(body, cfg.Thinking, cfg.Models)
+		body = res.Body
+		modelID = res.ModelID
+		if res.Done {
+			slog.Info("injected", "model", modelID, "mode", cfg.Thinking.Mode, "budget", cfg.Thinking.Budget)
+		} else if res.Reason != "" && modelID != "" {
+			slog.Info("skipped", "model", modelID, "reason", res.Reason)
 		}
 	}
 
@@ -226,6 +230,21 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, host strin
 	}
 	w.WriteHeader(upResp.StatusCode)
 
+	// Log non-success responses for debugging
+	if upResp.StatusCode >= 400 {
+		if !isChat {
+			respBody, _ := io.ReadAll(upResp.Body)
+			snippet := string(respBody)
+			if len(snippet) > 200 {
+				snippet = snippet[:200]
+			}
+			slog.Warn("upstream error", "status", upResp.StatusCode, "target", target, "body", snippet)
+			w.Write(respBody)
+			return
+		}
+		slog.Warn("upstream error (stream)", "status", upResp.StatusCode, "target", target)
+	}
+
 	// Stream with flush for event-stream responses (chat).
 	if f, ok := w.(http.Flusher); ok && isChat {
 		buf := make([]byte, 32*1024)
@@ -259,11 +278,36 @@ func isHopByHop(k string) bool {
 
 func (s *Server) isTarget(host string, cfg *config.Config) bool {
 	for _, t := range cfg.Targets {
-		if strings.EqualFold(host, t) {
+		if matchHost(host, t) {
 			return true
 		}
 	}
 	return false
+}
+
+// matchHost checks if host matches pattern. Pattern supports '*' as a wildcard
+// for exactly one DNS label (one or more non-dot characters).
+func matchHost(host, pattern string) bool {
+	if strings.EqualFold(host, pattern) {
+		return true
+	}
+	if !strings.Contains(pattern, "*") {
+		return false
+	}
+	hostParts := strings.Split(strings.ToLower(host), ".")
+	patParts := strings.Split(strings.ToLower(pattern), ".")
+	if len(hostParts) != len(patParts) {
+		return false
+	}
+	for i, p := range patParts {
+		if p == "*" {
+			continue
+		}
+		if p != hostParts[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Server) tunnel(clientConn net.Conn, target string, cfg *config.Config) {

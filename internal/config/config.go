@@ -28,6 +28,7 @@ type Config struct {
 	Thinking ThinkingConfig `json:"thinking"`
 	LogFile  string         `json:"log_file"`
 	Targets  []string       `json:"targets"`
+	Models   []string       `json:"models"`
 	Debug    bool           `json:"debug"`
 }
 
@@ -62,7 +63,8 @@ func Default() *Config {
 			Budget: 24576,
 		},
 		LogFile: "~/.kiro-think/kiro-think.log",
-		Targets: []string{"q.us-east-1.amazonaws.com"},
+		Targets: []string{"q.*.amazonaws.com"},
+		Models:  []string{"claude-sonnet-4.5", "claude-sonnet-4.6", "claude-opus-4.5", "claude-opus-4.6", "claude-opus-4.7"},
 	}
 }
 
